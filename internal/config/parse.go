@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -18,15 +19,20 @@ type value struct {
 }
 
 type Entry struct {
-	Kind       string
-	ID         string
-	start, end int
-	deleteEnd  int
-	options    map[string]value
-	changes    map[string]string
-	deleted    bool
-	fresh      bool
+	Kind                 string
+	ID                   string
+	start, end           int
+	deleteEnd            int
+	options              map[string]value
+	changes              map[string]string
+	deleted              bool
+	fresh                bool
+	group                string
+	originalGroup        string
+	groupStart, groupEnd int
 }
+
+func (e Entry) Group() string { return e.group }
 
 func (e Entry) Value(name string) string {
 	if v, ok := e.changes[name]; ok {
@@ -198,5 +204,45 @@ func parse(src string) ([]*Entry, map[string]bool, string, error) {
 		}
 		seen[key] = true
 	}
+	// Only comments are metadata; matching text inside quoted values is inert.
+	groups := map[string]bool{}
+	syntax.Walk(f, func(n syntax.Node) bool {
+		c, ok := n.(*syntax.Comment)
+		if !ok {
+			return true
+		}
+		text, ok := strings.CutPrefix(c.Text, " coy:model-group ")
+		if !ok {
+			return true
+		}
+		id, raw, _ := strings.Cut(text, " ")
+		name, err := strconv.Unquote(raw)
+		start := int(c.Pos().Offset())
+		line := src[:start]
+		if _, tail, found := strings.CutLast(line, "\n"); found {
+			line = tail
+		}
+		if err != nil || validateID("model", id) != nil || validGroup(name) != nil || name == "" || groups[id] || strings.TrimSpace(line) != "" {
+			readOnly = "coy 分组注释无效或重复；当前仅可查看"
+			return true
+		}
+		groups[id] = true
+		found := false
+		for _, e := range entries {
+			if start >= e.start && start < e.deleteEnd {
+				readOnly = "coy 分组注释必须独占一行，且位于配置命令之外；当前仅可查看"
+				return true
+			}
+			if e.Kind == "model" && e.ID == id {
+				found = true
+				e.group, e.originalGroup = name, name
+				e.groupStart, e.groupEnd = start, int(c.End().Offset())
+			}
+		}
+		if !found {
+			readOnly = "coy 分组注释引用了不存在的模型；当前仅可查看"
+		}
+		return true
+	})
 	return entries, refs, readOnly, nil
 }

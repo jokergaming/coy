@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Document struct {
@@ -154,6 +157,26 @@ func (d *Document) Put(e *Entry, kind, id string, fields map[string]string) erro
 }
 
 func (d *Document) Delete(e *Entry) error {
+	return d.DeleteEntries([]*Entry{e})
+}
+
+// DeleteEntries validates the entire selection before changing the draft.
+func (d *Document) DeleteEntries(entries []*Entry) error {
+	for _, e := range entries {
+		if e == nil {
+			return errors.New("未选择条目")
+		}
+		if err := d.canDelete(e); err != nil {
+			return err
+		}
+	}
+	for _, e := range entries {
+		e.deleted = true
+	}
+	return nil
+}
+
+func (d *Document) canDelete(e *Entry) error {
 	if err := d.editable(e); err != nil {
 		return err
 	}
@@ -169,7 +192,33 @@ func (d *Document) Delete(e *Entry) error {
 			}
 		}
 	}
-	e.deleted = true
+	return nil
+}
+
+func validGroup(name string) error {
+	if !utf8.ValidString(name) || utf8.RuneCountInString(name) > 80 || strings.IndexFunc(name, unicode.IsControl) >= 0 || name != strings.TrimSpace(name) {
+		return errors.New("分组名最多 80 字，不能包含控制字符或首尾空白")
+	}
+	return nil
+}
+
+// GroupModels uses inert comments, leaving Crush's model IDs and flags intact.
+// An empty name removes membership; names are scoped to each provider.
+func (d *Document) GroupModels(entries []*Entry, name string) error {
+	if err := validGroup(name); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e == nil || e.Kind != "model" {
+			return errors.New("只能对自定义模型分组")
+		}
+		if err := d.editable(e); err != nil {
+			return err
+		}
+	}
+	for _, e := range entries {
+		e.group = name
+	}
 	return nil
 }
 
@@ -182,6 +231,17 @@ func (d *Document) Generate() (string, error) {
 	var patches []patch
 	var added strings.Builder
 	for _, e := range d.entries {
+		if e.group != e.originalGroup || e.deleted {
+			metadata := ""
+			if e.group != "" && !e.deleted {
+				metadata = "# coy:model-group " + e.ID + " " + strconv.Quote(e.group)
+			}
+			if e.groupEnd > 0 {
+				patches = append(patches, patch{e.groupStart, e.groupEnd, metadata})
+			} else if metadata != "" {
+				added.WriteString(metadata + "\n")
+			}
+		}
 		if e.deleted {
 			if !e.fresh {
 				patches = append(patches, patch{e.start, e.deleteEnd, ""})
@@ -249,7 +309,7 @@ func (d *Document) Preview() string {
 			fmt.Fprintf(&b, "- %s %s\n", e.Kind, e.ID)
 			continue
 		}
-		if !e.fresh && len(e.changes) == 0 {
+		if !e.fresh && len(e.changes) == 0 && e.group == e.originalGroup {
 			continue
 		}
 		prefix := "~"
@@ -257,6 +317,13 @@ func (d *Document) Preview() string {
 			prefix = "+"
 		}
 		fmt.Fprintf(&b, "%s %s %s\n", prefix, e.Kind, e.ID)
+		if e.group != e.originalGroup {
+			state := "已设置（值隐藏）"
+			if e.group == "" {
+				state = "已移出"
+			}
+			fmt.Fprintf(&b, "    分组: %s\n", state)
+		}
 		for _, f := range Fields(e.Kind) {
 			if _, changed := e.changes[f.Name]; !changed {
 				continue

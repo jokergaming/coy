@@ -28,41 +28,43 @@ type discoveryMsg struct {
 }
 
 type Model struct {
-	store            *config.Store
-	doc              *config.Document
-	dryRun           bool
-	width, height    int
-	cursor           int
-	modelCursor      int
-	modelPane        bool
-	collapsed        map[string]bool
-	cancelDiscovery  context.CancelFunc
-	discoveryContext context.Context
-	mode             string
-	status           string
-	busy             bool
-	editing          *config.Entry
-	kind             string
-	inputs           []textinput.Model
-	labels           []string
-	focus            int
-	preview          string
-	previewOffset    int
+	store              *config.Store
+	doc                *config.Document
+	dryRun             bool
+	width, height      int
+	cursor             int
+	modelCursor        int
+	modelPane          bool
+	collapsed          map[string]bool
+	groupCollapsed     map[string]bool
+	selection          map[string]bool
+	pendingDelete      []*config.Entry
+	filter, filterKind string
+	searchKind         string
+	query              textinput.Model
+	cancelDiscovery    context.CancelFunc
+	discoveryContext   context.Context
+	mode               string
+	status             string
+	busy               bool
+	editing            *config.Entry
+	kind               string
+	inputs             []textinput.Model
+	labels             []string
+	focus              int
+	preview            string
+	previewOffset      int
 }
 
 func New(store *config.Store, doc *config.Document, dryRun bool) Model {
-	return Model{store: store, doc: doc, dryRun: dryRun, width: 80, height: 24, mode: "list", collapsed: map[string]bool{}}
+	return Model{store: store, doc: doc, dryRun: dryRun, width: 80, height: 24, mode: "list", collapsed: map[string]bool{}, groupCollapsed: map[string]bool{}, selection: map[string]bool{}}
 }
 
 func (m Model) Init() tea.Cmd { return nil }
 
 func (m Model) selected() *config.Entry {
 	if m.modelPane {
-		models := m.models()
-		if len(models) == 0 {
-			return nil
-		}
-		return models[min(m.modelCursor, len(models)-1)]
+		return m.currentRow().entry
 	}
 	return m.provider()
 }
@@ -119,6 +121,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.query.Width = max(10, m.width-16)
 		for i := range m.inputs {
 			m.inputs[i].Width = max(10, min(80, m.width-8))
 		}
@@ -191,6 +194,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == "form" {
 			return m.updateForm(msg)
 		}
+		if m.mode == "search" {
+			return m.updateSearch(msg)
+		}
+		if m.mode == "group" {
+			return m.updateGroup(msg)
+		}
 		if m.mode == "preview" {
 			switch key {
 			case "esc", "q", "ctrl+c":
@@ -205,6 +214,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(m.mode, "confirm-") {
 			if key == "esc" || key == "n" || key == "ctrl+c" {
 				m.mode = "list"
+				m.pendingDelete = nil
+				return m, nil
+			}
+			if m.mode == "confirm-delete" && (key == "up" || key == "down" || key == "j" || key == "k") {
+				step := 1
+				if key == "up" || key == "k" {
+					step = -1
+				}
+				m.previewOffset = max(0, min(m.previewOffset+step, len(m.pendingDelete)-1))
 				return m, nil
 			}
 			if key != "y" {
@@ -217,13 +235,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.busy = true
 				return m, m.save(m.dryRun)
 			case "confirm-delete":
-				if err := m.doc.Delete(m.selected()); err != nil {
+				if err := m.doc.DeleteEntries(m.pendingDelete); err != nil {
 					m.status = err.Error()
 				} else {
 					m.status = "已从编辑草稿删除，尚未写入。"
+					clear(m.selection)
 				}
+				m.pendingDelete = nil
 				m.cursor = min(m.cursor, max(0, len(m.providers())-1))
-				m.modelCursor = min(m.modelCursor, max(0, len(m.models())-1))
+				m.modelCursor = min(m.modelCursor, max(0, len(m.modelRows())-1))
 				m.mode = "list"
 			}
 			return m, nil
@@ -246,14 +266,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openProvider()
 			}
 		case "right", "l":
+			if m.modelPane && m.currentRow().entry == nil {
+				m.groupCollapsed[m.groupKey(m.currentRow().group)] = false
+				return m, nil
+			}
 			m.openProvider()
 		case "left", "h", "esc":
 			if m.modelPane {
+				if row := m.currentRow(); key != "esc" && row.entry == nil && row.group != "" && !m.groupCollapsed[m.groupKey(row.group)] {
+					m.toggleGroup()
+					return m, nil
+				}
 				m.modelPane = false
 			} else if p := m.provider(); p != nil {
 				m.collapsed[p.ID] = true
 			}
 		case " ":
+			if m.modelPane {
+				if e := m.selected(); e != nil {
+					if m.selection[e.ID] {
+						delete(m.selection, e.ID)
+					} else {
+						m.selection[e.ID] = true
+					}
+				} else {
+					m.toggleGroup()
+				}
+			}
 			if p := m.provider(); p != nil && !m.modelPane {
 				m.collapsed[p.ID] = !m.collapsed[p.ID]
 			}
@@ -262,16 +301,65 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openProvider()
 				return m, nil
 			}
+			if m.currentRow().entry == nil {
+				m.toggleGroup()
+				return m, nil
+			}
 			if e := m.selected(); e != nil && m.doc.ReadOnly == "" {
 				cmd := m.form(e.Kind, e)
 				return m, cmd
 			}
-		case "n", "m", "e", "d", "r":
+		case "/", "?":
+			m.openProvider()
+			if m.modelPane {
+				kind := "fuzzy"
+				if key == "?" {
+					kind = "regex"
+				}
+				cmd := m.startSearch(kind)
+				return m, cmd
+			}
+		case "ctrl+l":
+			m.filter, m.filterKind, m.modelCursor = "", "", 0
+		case "ctrl+a":
+			if m.modelPane {
+				matches, err := m.matchingModels()
+				if err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				clear(m.selection)
+				for _, e := range matches {
+					m.selection[e.ID] = true
+				}
+			}
+		case "ctrl+u":
+			clear(m.selection)
+		case "n", "m", "e", "d", "r", "g", "G":
 			if m.doc.ReadOnly != "" {
 				m.status = m.doc.ReadOnly
 				return m, nil
 			}
 			switch key {
+			case "g", "G":
+				if !m.modelPane {
+					return m, nil
+				}
+				if key == "g" {
+					cmd := m.startGroup()
+					return m, cmd
+				}
+				targets := m.modelTargets()
+				if len(targets) == 0 {
+					m.status = "请先选择要移出分组的模型。"
+					return m, nil
+				}
+				if err := m.doc.GroupModels(targets, ""); err != nil {
+					m.status = err.Error()
+				} else {
+					clear(m.selection)
+					m.modelCursor, m.status = 0, "已移出分组草稿；s 保存。"
+				}
 			case "r":
 				cmd := m.discoverProvider()
 				return m, cmd
@@ -291,9 +379,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, cmd
 				}
 			case "d":
-				if m.selected() != nil {
-					m.mode = "confirm-delete"
-				}
+				m.requestDelete()
 			}
 		case "p":
 			m.busy = true
@@ -309,6 +395,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.mode == "form" && len(m.inputs) > 0 {
 		var cmd tea.Cmd
 		m.inputs[m.focus], cmd = m.inputs[m.focus].Update(msg)
+		return m, cmd
+	}
+	if m.mode == "search" || m.mode == "group" {
+		var cmd tea.Cmd
+		m.query, cmd = m.query.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -375,6 +466,7 @@ func (m Model) View() string {
 		return "窗口过小，请调整至至少 40 × 12。\nq 退出（未保存时需确认）。"
 	}
 	var b strings.Builder
+	compact := m.height < 18
 	header := "coy · crush-on-you"
 	if m.dryRun {
 		header += "  [DRY RUN]"
@@ -382,7 +474,10 @@ func (m Model) View() string {
 	if m.doc.Dirty() {
 		header += "  ● 未保存"
 	}
-	b.WriteString(accent.Render(header) + "\n" + muted.Render(clean(m.store.Path)) + "\n\n")
+	b.WriteString(accent.Render(header) + "\n" + muted.Render(clean(m.store.Path)) + "\n")
+	if !compact {
+		b.WriteByte('\n')
+	}
 	switch m.mode {
 	case "form":
 		b.WriteString(accent.Render("编辑 "+m.kind) + "\n")
@@ -399,9 +494,15 @@ func (m Model) View() string {
 		b.WriteString(strings.Join(lines[start:min(len(lines), start+max(1, m.height-9))], "\n") + "\n")
 		b.WriteString(muted.Render("↑↓ 滚动 · Esc 返回"))
 	case "confirm-delete":
-		if e := m.selected(); e != nil {
-			b.WriteString("从草稿删除 " + clean(e.ID) + "？y 确认 / n 取消")
+		b.WriteString(fmt.Sprintf("从草稿删除以下 %d 个条目？y 确认 / n 取消\n", len(m.pendingDelete)))
+		start := min(m.previewOffset, len(m.pendingDelete))
+		for _, e := range m.pendingDelete[start:min(len(m.pendingDelete), start+max(1, m.height-10))] {
+			b.WriteString("  " + clean(e.ID) + "\n")
 		}
+		b.WriteString(muted.Render("↑↓ 查看全部待删条目；任何引用冲突会阻止整批删除。"))
+	case "group":
+		b.WriteString(fmt.Sprintf("将 %d 个模型加入分组（同名则合并）\n", len(m.modelTargets())))
+		b.WriteString(m.query.View() + "\nEnter 确认草稿 · Esc 取消")
 	case "confirm-quit":
 		b.WriteString("存在未保存的修改。丢弃并退出？y 确认 / n 取消")
 	case "confirm-save":
@@ -410,8 +511,28 @@ func (m Model) View() string {
 		if m.doc.ReadOnly != "" {
 			b.WriteString("只读：" + m.doc.ReadOnly + "\n")
 		}
+		if m.mode != "search" && m.filter != "" {
+			label := "模糊搜索"
+			if m.filterKind == "regex" {
+				label = "正则筛选"
+			}
+			b.WriteString(muted.Render(label+"："+clean(m.filter)) + "\n")
+		}
 		b.WriteString(m.browserView())
-		b.WriteString("\n" + muted.Render("↑↓/jk 选择 · Tab 切栏 · →/Enter 进入 · ← 返回 · 空格 折叠\nn 新增提供商 · m 新增模型 · e 编辑 · d 删除 · r 发现模型\np 预览 · s 保存 · q 退出"))
+		if m.mode == "search" {
+			label := "模糊搜索"
+			if m.searchKind == "regex" {
+				label = "正则筛选"
+			}
+			b.WriteString(label + " " + m.query.View() + "\nTab 切换匹配方式 · Enter 应用 · Esc 取消")
+			if m.searchKind == "regex" {
+				b.WriteString("\n" + muted.Render(regexHelp))
+			}
+		} else if compact {
+			b.WriteString(muted.Render("/ 搜索 · ? 正则 · g 分组 · d 删除\n空格 多选/折叠 · s 保存 · q 退出"))
+		} else {
+			b.WriteString("\n" + muted.Render("↑↓/jk 移动 · Tab 切栏 · 空格 多选/折叠 · Enter 编辑/展开\n/ 模糊 · ? 正则 · Ctrl+L 清筛选 · Ctrl+A 全选匹配 · Ctrl+U 清选\ng 分组 · G 移出 · d 删除 · n/m 新增 · e 编辑 · r 发现\np 预览 · s 保存 · q 退出"))
+		}
 	}
 	if m.busy {
 		b.WriteString("\n处理中…")
@@ -420,7 +541,10 @@ func (m Model) View() string {
 		}
 	}
 	if m.status != "" {
-		b.WriteString("\n\n" + clean(m.status))
+		if !compact {
+			b.WriteByte('\n')
+		}
+		b.WriteString("\n" + clean(m.status))
 	}
 	return lipgloss.NewStyle().MaxWidth(m.width).Render(b.String()) + "\n"
 }

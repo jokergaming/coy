@@ -46,10 +46,14 @@ func (m Model) models() []*config.Entry {
 
 func (m *Model) move(step int) {
 	if m.modelPane {
-		m.modelCursor = max(0, min(m.modelCursor+step, len(m.models())-1))
+		m.modelCursor = max(0, min(m.modelCursor+step, len(m.modelRows())-1))
 		return
 	}
-	m.cursor = max(0, min(m.cursor+step, len(m.providers())-1))
+	next := max(0, min(m.cursor+step, len(m.providers())-1))
+	if next != m.cursor {
+		clear(m.selection)
+	}
+	m.cursor = next
 	m.modelCursor = 0
 }
 
@@ -61,6 +65,8 @@ func (m *Model) openProvider() {
 }
 
 func (m *Model) selectEntry(kind, id string) {
+	clear(m.selection)
+	m.filter, m.filterKind = "", ""
 	provider := id
 	if kind == "model" {
 		provider, _, _ = strings.Cut(id, "/")
@@ -74,8 +80,13 @@ func (m *Model) selectEntry(kind, id string) {
 	m.modelPane = kind == "model"
 	if kind == "model" {
 		m.collapsed[provider] = false
-		for i, e := range m.models() {
+		for _, e := range m.models() {
 			if e.ID == id {
+				m.groupCollapsed[m.groupKey(e.Group())] = false
+			}
+		}
+		for i, row := range m.modelRows() {
+			if row.entry != nil && row.entry.ID == id {
 				m.modelCursor = i
 				break
 			}
@@ -115,9 +126,18 @@ func (m *Model) discoverProvider() tea.Cmd {
 }
 
 func (m Model) browserView() string {
-	rows := max(1, m.height-14)
+	rows := max(1, m.height-16)
+	if m.height < 18 {
+		rows = max(1, m.height-11)
+	}
+	if m.mode != "search" && m.filter != "" {
+		rows = max(1, rows-1)
+	}
+	if m.mode == "search" && m.searchKind == "regex" {
+		rows = max(1, rows-strings.Count(regexHelp, "\n")-1)
+	}
 	left, right := []string{"提供商 /"}, []string{"模型"}
-	providers, models := m.providers(), m.models()
+	providers, models := m.providers(), m.modelRows()
 	if len(providers) == 0 {
 		left = append(left, "按 n 新增目录")
 	}
@@ -138,20 +158,48 @@ func (m Model) browserView() string {
 		left = append(left, line)
 	}
 	if p := m.provider(); p != nil {
-		right[0] = fmt.Sprintf("模型 /%s/ (%d)", clean(p.ID), len(models))
+		matches, err := m.matchingModels()
+		right[0] = fmt.Sprintf("模型 /%s/ %d/%d · 选%d", clean(p.ID), len(matches), len(m.models()), len(m.chosenModels()))
+		query, kind := m.activeFilter()
+		if query != "" {
+			label := "模糊"
+			if kind == "regex" {
+				label = "正则"
+			}
+			right[0] += " [" + label + "]"
+		}
 		if m.collapsed[p.ID] {
 			right = append(right, "目录已折叠，→ 展开")
 		} else {
-			if len(models) == 0 {
-				right = append(right, "空目录：m 添加 / r 发现")
+			if err != nil {
+				right = append(right, err.Error())
+			} else if len(models) == 0 {
+				message := "空目录：m 添加 / r 发现"
+				if query != "" {
+					message = "无匹配模型；Ctrl+L 清除筛选"
+				}
+				right = append(right, message)
 			}
 			start := max(0, m.modelCursor-rows+1)
 			for i := start; i < min(len(models), start+rows); i++ {
-				branch := "├─ "
-				if i == len(models)-1 {
-					branch = "└─ "
+				row := models[i]
+				line := "  "
+				if row.entry == nil {
+					branch := "▾ "
+					if query == "" && m.groupCollapsed[m.groupKey(row.group)] {
+						branch = "▸ "
+					}
+					line += branch + clean(row.group) + fmt.Sprintf("/ (%d)", row.count)
+				} else {
+					if row.group != "" {
+						line += "  "
+					}
+					mark := "[ ] "
+					if m.selection[row.entry.ID] {
+						mark = "[x] "
+					}
+					line += mark + clean(strings.TrimPrefix(row.entry.ID, p.ID+"/"))
 				}
-				line := "  " + branch + clean(strings.TrimPrefix(models[i].ID, p.ID+"/"))
 				if i == m.modelCursor && m.modelPane {
 					line = accent.Render("›" + line[1:])
 				}
