@@ -105,6 +105,32 @@ func (d *Document) editable(e *Entry) error {
 	return nil
 }
 
+// withModelName shares the name rule between form edits and repairs at save time.
+// Copies keep previews and failed saves from changing the editing draft.
+func (e *Entry) withModelName() *Entry {
+	if e.Kind != "model" || e.deleted || e.Value("name") != "" {
+		return e
+	}
+	_, name, _ := strings.Cut(e.ID, "/")
+	next := *e
+	next.changes = map[string]string{}
+	maps.Copy(next.changes, e.changes)
+	next.changes["name"] = name
+	return &next
+}
+
+func (d *Document) forSave() *Document {
+	if d.ReadOnly != "" {
+		return d
+	}
+	next := *d
+	next.entries = make([]*Entry, len(d.entries))
+	for i, e := range d.entries {
+		next.entries[i] = e.withModelName()
+	}
+	return &next
+}
+
 // Put updates only changed form fields. Unchanged shell expressions stay byte exact.
 // IDs are immutable to avoid rewriting references in unrelated configuration.
 func (d *Document) Put(e *Entry, kind, id string, fields map[string]string) error {
@@ -153,6 +179,7 @@ func (d *Document) Put(e *Entry, kind, id string, fields map[string]string) erro
 			e.changes[f.Name] = v
 		}
 	}
+	*e = *e.withModelName()
 	return nil
 }
 

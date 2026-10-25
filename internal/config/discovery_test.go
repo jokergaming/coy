@@ -14,13 +14,16 @@ func TestImportModelsIsAtomicAndPreservesConfiguration(t *testing.T) {
 	if _, err := d.AddModels("mine", map[string]string{"valid": "Valid", "z invalid": "Invalid"}); err == nil || d.Dirty() {
 		t.Fatal("invalid discovery must not partially import")
 	}
-	count, err := d.AddModels("mine", map[string]string{"existing": "Replace", "vendor/new": "New"})
-	if err != nil || count != 1 {
+	count, err := d.AddModels("mine", map[string]string{"existing": "Replace", "vendor/new": "New", "vendor/unnamed": ""})
+	if err != nil || count != 2 {
 		t.Fatal("import failed", err)
 	}
 	out, err := d.Generate()
 	if err != nil || !strings.HasPrefix(out, source) || !strings.Contains(out, "model add 'mine/vendor/new' --name 'New'") {
 		t.Fatal("import changed existing configuration", err)
+	}
+	if !strings.Contains(out, "model add 'mine/vendor/unnamed' --name 'vendor/unnamed'") {
+		t.Fatal("ID-only discovery must write an explicit model name")
 	}
 	if _, err := d.AddModels("openai", map[string]string{"new": "New"}); err == nil {
 		t.Fatal("import must not manage built-in provider")

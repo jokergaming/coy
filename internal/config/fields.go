@@ -25,7 +25,7 @@ var ProviderFields = []Field{
 }
 
 var ModelFields = []Field{
-	{"name", "名称", "text"}, {"context-window", "上下文窗口", "int"},
+	{"name", "名称（留空使用模型 ID）", "text"}, {"context-window", "上下文窗口", "int"},
 	{"default-max-tokens", "最大输出 tokens", "int"}, {"can-reason", "推理能力（true/false）", "bool"},
 	{"supports-images", "图片输入（true/false）", "bool"},
 	{"price-input", "输入价格 / 百万 tokens", "float"}, {"price-output", "输出价格 / 百万 tokens", "float"},

@@ -56,14 +56,20 @@ func TestCreatePreviewSaveAndReload(t *testing.T) {
 			if !m.modelPane || len(m.models()) != 1 {
 				t.Fatal("discovered model not shown", m.status)
 			}
+			if m.models()[0].Value("name") != "auto-model" {
+				t.Fatal("ID-only discovery did not set a model name")
+			}
 			m, _ = update(t, m, key("d"))
 			m, _ = update(t, m, key("y"))
 			m, _ = update(t, m, key("m"))
 			m.inputs[0].SetValue("my-api/model-v1")
-			m.inputs[1].SetValue("Model V1")
 			m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 			if len(d.Entries()) != 2 {
 				t.Fatal("model not created", m.status)
+			}
+			generated, err := d.Generate()
+			if err != nil || !strings.Contains(generated, "model add 'my-api/model-v1' --name 'model-v1'") {
+				t.Fatal("blank model name was omitted from crushrc", err)
 			}
 			m, cmd = update(t, m, key("p"))
 			if cmd == nil {
@@ -96,6 +102,9 @@ func TestCreatePreviewSaveAndReload(t *testing.T) {
 				_, loaded, err := config.Load(path)
 				if err != nil || len(loaded.Entries()) != 2 {
 					t.Fatal("saved config cannot be loaded", err)
+				}
+				if loaded.Entries()[1].Value("name") != "model-v1" {
+					t.Fatal("saved config lost the model name")
 				}
 			}
 		})
@@ -152,5 +161,50 @@ func TestSaveFailureKeepsDraft(t *testing.T) {
 	m, _ = update(t, m, cmd())
 	if !d.Dirty() || !strings.Contains(m.status, "外部修改") {
 		t.Fatal("failed save lost edits or hid error")
+	}
+}
+
+func TestSaveRepairsUntouchedModelNames(t *testing.T) {
+	const source = "provider add mine --type openai-compat --base-url https://example.invalid\nmodel add mine/old\n"
+	for _, dryRun := range []bool{false, true} {
+		t.Run(map[bool]string{false: "save", true: "dry-run"}[dryRun], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "crushrc")
+			if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+				t.Fatal(err)
+			}
+			s, d, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := New(s, d, dryRun)
+			m, cmd := update(t, m, key("p"))
+			m, _ = update(t, m, cmd())
+			if !strings.Contains(m.preview, "~ model mine/old\n    --name:") {
+				t.Fatal("preview omitted automatic name repair")
+			}
+			m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+			m, cmd = update(t, m, key("s"))
+			if !dryRun {
+				if m.mode != "confirm-save" {
+					t.Fatal("repair must require save confirmation")
+				}
+				m, cmd = update(t, m, key("y"))
+			}
+			if cmd == nil {
+				t.Fatal("untouched model blocked saving")
+			}
+			m, _ = update(t, m, cmd())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dryRun {
+				if m.mode != "preview" || string(data) != source {
+					t.Fatal("dry-run wrote configuration or omitted preview")
+				}
+			} else if string(data) != strings.Replace(source, "model add mine/old\n", "model add mine/old --name 'old'\n", 1) || m.doc.Entries()[1].Value("name") != "old" {
+				t.Fatal("saving did not repair untouched model", m.status)
+			}
+		})
 	}
 }

@@ -88,6 +88,7 @@ type Result struct {
 }
 
 func (s *Store) Save(d *Document, dryRun bool) (Result, error) {
+	d = d.forSave()
 	r := Result{Preview: d.Preview(), DryRun: dryRun}
 	content, err := d.Generate()
 	if err != nil {

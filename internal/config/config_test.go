@@ -157,6 +157,44 @@ func TestValidation(t *testing.T) {
 	}
 }
 
+func TestModelNameIsAlwaysWritten(t *testing.T) {
+	for _, tc := range []struct {
+		label, source, name, want string
+	}{
+		{label: "new without name", want: "google/gemma-3-4b-it"},
+		{label: "custom name", name: "Gemma's $(literal)", want: "Gemma's $(literal)"},
+		{label: "edit unnamed", source: "model add mine/google/gemma-3-4b-it --unknown keep\n", want: "google/gemma-3-4b-it"},
+		{label: "clear name", source: "model add mine/google/gemma-3-4b-it --name 'Old'\n", want: "google/gemma-3-4b-it"},
+		{label: "preserve expression", source: "model add mine/google/gemma-3-4b-it --name \"$MODEL_NAME\"\n", name: `"$MODEL_NAME"`, want: `"$MODEL_NAME"`},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			d := mustParse(t, "provider add mine --type openai-compat --base-url https://example.invalid\n"+tc.source)
+			var e *Entry
+			if tc.source != "" {
+				e = d.Entries()[1]
+			}
+			input := map[string]string{"name": tc.name}
+			if err := d.Put(e, "model", "mine/google/gemma-3-4b-it", input); err != nil {
+				t.Fatal(err)
+			}
+			if input["name"] != tc.name {
+				t.Fatal("Put mutated caller fields")
+			}
+			out, err := d.Generate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			loaded := mustParse(t, out)
+			if loaded.ReadOnly != "" || loaded.Entries()[1].Value("name") != tc.want || !strings.Contains(out, "--name ") {
+				t.Fatalf("model name missing or unsafe: %q", out)
+			}
+			if strings.Contains(tc.source, "--unknown keep") && !strings.Contains(out, "--unknown keep") {
+				t.Fatal("unrelated model option changed")
+			}
+		})
+	}
+}
+
 func TestSaveBackupDryRunAndConflict(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "crushrc")
