@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 )
@@ -57,6 +58,38 @@ func (d *Document) Providers() []string {
 		}
 	}
 	return ids
+}
+
+// AddModels imports a complete catalogue transactionally. Existing custom
+// models win; invalid IDs leave the entire draft unchanged.
+func (d *Document) AddModels(provider string, models map[string]string) (int, error) {
+	if err := d.editable(nil); err != nil {
+		return 0, err
+	}
+	if !d.customProvider(provider) {
+		return 0, errors.New("请先创建对应的自定义提供商")
+	}
+	existing := map[string]bool{}
+	for _, e := range d.Entries() {
+		if e.Kind == "model" {
+			existing[e.ID] = true
+		}
+	}
+	next := *d
+	next.entries = slices.Clone(d.entries)
+	count := 0
+	for _, id := range slices.Sorted(maps.Keys(models)) {
+		fullID := provider + "/" + id
+		if existing[fullID] {
+			continue
+		}
+		if err := next.Put(nil, "model", fullID, map[string]string{"name": models[id]}); err != nil {
+			return 0, fmt.Errorf("发现的模型无法安全导入：%w", err)
+		}
+		count++
+	}
+	d.entries = next.entries
+	return count, nil
 }
 
 func (d *Document) editable(e *Entry) error {

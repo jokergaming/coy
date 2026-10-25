@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"unicode"
 
 	"coy/internal/config"
+	"coy/internal/discovery"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -19,36 +21,50 @@ type saveMsg struct {
 	err    error
 }
 
+type discoveryMsg struct {
+	provider string
+	models   []discovery.Model
+	err      error
+}
+
 type Model struct {
-	store         *config.Store
-	doc           *config.Document
-	dryRun        bool
-	width, height int
-	cursor        int
-	mode          string
-	status        string
-	busy          bool
-	editing       *config.Entry
-	kind          string
-	inputs        []textinput.Model
-	labels        []string
-	focus         int
-	preview       string
-	previewOffset int
+	store            *config.Store
+	doc              *config.Document
+	dryRun           bool
+	width, height    int
+	cursor           int
+	modelCursor      int
+	modelPane        bool
+	collapsed        map[string]bool
+	cancelDiscovery  context.CancelFunc
+	discoveryContext context.Context
+	mode             string
+	status           string
+	busy             bool
+	editing          *config.Entry
+	kind             string
+	inputs           []textinput.Model
+	labels           []string
+	focus            int
+	preview          string
+	previewOffset    int
 }
 
 func New(store *config.Store, doc *config.Document, dryRun bool) Model {
-	return Model{store: store, doc: doc, dryRun: dryRun, width: 80, height: 24, mode: "list"}
+	return Model{store: store, doc: doc, dryRun: dryRun, width: 80, height: 24, mode: "list", collapsed: map[string]bool{}}
 }
 
 func (m Model) Init() tea.Cmd { return nil }
 
 func (m Model) selected() *config.Entry {
-	entries := m.doc.Entries()
-	if len(entries) == 0 {
-		return nil
+	if m.modelPane {
+		models := m.models()
+		if len(models) == 0 {
+			return nil
+		}
+		return models[min(m.modelCursor, len(models)-1)]
 	}
-	return entries[min(m.cursor, len(entries)-1)]
+	return m.provider()
 }
 
 func (m *Model) form(kind string, e *config.Entry) tea.Cmd {
@@ -61,12 +77,8 @@ func (m *Model) form(kind string, e *config.Entry) tea.Cmd {
 		input.CharLimit = 256
 		m.labels = append(m.labels, "ID（保存后不可重命名）")
 		if kind == "model" {
-			if selected := m.selected(); selected != nil {
-				p := selected.ID
-				if selected.Kind == "model" {
-					p, _, _ = strings.Cut(p, "/")
-				}
-				input.SetValue(p + "/")
+			if p := m.provider(); p != nil {
+				input.SetValue(p.ID + "/")
 			}
 		}
 		m.inputs = append(m.inputs, input)
@@ -82,8 +94,14 @@ func (m *Model) form(kind string, e *config.Entry) tea.Cmd {
 			input.SetValue(e.Value(f.Name))
 		} else if f.Name == "type" {
 			input.SetValue("openai-compat")
+		} else if kind == "provider" && f.Name == "discover-models" {
+			// Persist the curated list so Crush does not reintroduce deleted models.
+			input.SetValue("false")
 		}
 		label := f.Label
+		if kind == "provider" && f.Name == "discover-models" {
+			label = "Crush 启动时继续发现（false 保留模型删选结果）"
+		}
 		if e != nil && e.Dynamic(f.Name) {
 			label += "（保留原表达式；修改后按字面值保存）"
 		}
@@ -104,6 +122,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i := range m.inputs {
 			m.inputs[i].Width = max(10, min(80, m.width-8))
 		}
+		return m, nil
+	case discoveryMsg:
+		m.busy = false
+		cancelled := m.discoveryContext != nil && m.discoveryContext.Err() != nil
+		if m.cancelDiscovery != nil {
+			m.cancelDiscovery()
+			m.cancelDiscovery = nil
+		}
+		m.discoveryContext = nil
+		if cancelled {
+			m.status = "模型发现已取消；提供商草稿已保留。"
+			return m, nil
+		}
+		if msg.err != nil {
+			m.status = "模型发现失败：" + msg.err.Error() + "；提供商草稿已保留，可编辑后按 r 重试或 m 手动添加。"
+			return m, nil
+		}
+		models := map[string]string{}
+		for _, model := range msg.models {
+			models[model.ID] = model.Name
+		}
+		count, err := m.doc.AddModels(msg.provider, models)
+		if err != nil {
+			m.status = err.Error() + "；模型未导入，提供商草稿已保留。"
+			return m, nil
+		}
+		m.selectEntry("provider", msg.provider)
+		m.collapsed[msg.provider] = false
+		m.modelPane = true
+		m.modelCursor = 0
+		m.status = fmt.Sprintf("模型发现完成：新增 %d 个模型到草稿；d 删除所选模型，s 保存。", count)
 		return m, nil
 	case saveMsg:
 		m.busy = false
@@ -133,6 +182,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		if m.busy {
+			if m.cancelDiscovery != nil && (msg.String() == "esc" || msg.String() == "ctrl+c") {
+				m.cancelDiscovery()
+			}
 			return m, nil
 		}
 		key := msg.String()
@@ -170,7 +222,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.status = "已从编辑草稿删除，尚未写入。"
 				}
-				m.cursor = min(m.cursor, max(0, len(m.doc.Entries())-1))
+				m.cursor = min(m.cursor, max(0, len(m.providers())-1))
+				m.modelCursor = min(m.modelCursor, max(0, len(m.models())-1))
 				m.mode = "list"
 			}
 			return m, nil
@@ -183,15 +236,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 		case "up", "k":
-			m.cursor = max(0, m.cursor-1)
+			m.move(-1)
 		case "down", "j":
-			m.cursor = min(max(0, len(m.doc.Entries())-1), m.cursor+1)
-		case "n", "m", "e", "enter", "d":
+			m.move(1)
+		case "tab", "shift+tab":
+			if m.modelPane {
+				m.modelPane = false
+			} else {
+				m.openProvider()
+			}
+		case "right", "l":
+			m.openProvider()
+		case "left", "h", "esc":
+			if m.modelPane {
+				m.modelPane = false
+			} else if p := m.provider(); p != nil {
+				m.collapsed[p.ID] = true
+			}
+		case " ":
+			if p := m.provider(); p != nil && !m.modelPane {
+				m.collapsed[p.ID] = !m.collapsed[p.ID]
+			}
+		case "enter":
+			if !m.modelPane {
+				m.openProvider()
+				return m, nil
+			}
+			if e := m.selected(); e != nil && m.doc.ReadOnly == "" {
+				cmd := m.form(e.Kind, e)
+				return m, cmd
+			}
+		case "n", "m", "e", "d", "r":
 			if m.doc.ReadOnly != "" {
 				m.status = m.doc.ReadOnly
 				return m, nil
 			}
 			switch key {
+			case "r":
+				cmd := m.discoverProvider()
+				return m, cmd
 			case "n":
 				cmd := m.form("provider", nil)
 				return m, cmd
@@ -202,7 +285,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				cmd := m.form("model", nil)
 				return m, cmd
-			case "e", "enter":
+			case "e":
 				if e := m.selected(); e != nil {
 					cmd := m.form(e.Kind, e)
 					return m, cmd
@@ -262,9 +345,15 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = err.Error()
 			return m, nil
 		}
+		createdProvider := m.editing == nil && m.kind == "provider"
+		m.selectEntry(m.kind, id)
 		m.mode = "list"
 		m.inputs = nil
 		m.status = "已更新编辑草稿；p 预览，s 保存。"
+		if createdProvider && fields["disable"] != "true" {
+			cmd := m.discoverProvider()
+			return m, cmd
+		}
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -310,7 +399,9 @@ func (m Model) View() string {
 		b.WriteString(strings.Join(lines[start:min(len(lines), start+max(1, m.height-9))], "\n") + "\n")
 		b.WriteString(muted.Render("↑↓ 滚动 · Esc 返回"))
 	case "confirm-delete":
-		b.WriteString("删除当前条目的编辑草稿？y 确认 / n 取消")
+		if e := m.selected(); e != nil {
+			b.WriteString("从草稿删除 " + clean(e.ID) + "？y 确认 / n 取消")
+		}
 	case "confirm-quit":
 		b.WriteString("存在未保存的修改。丢弃并退出？y 确认 / n 取消")
 	case "confirm-save":
@@ -319,24 +410,14 @@ func (m Model) View() string {
 		if m.doc.ReadOnly != "" {
 			b.WriteString("只读：" + m.doc.ReadOnly + "\n")
 		}
-		entries := m.doc.Entries()
-		rows := max(1, m.height-11)
-		start := max(0, m.cursor-rows+1)
-		if len(entries) == 0 {
-			b.WriteString("暂无可管理的自定义条目。按 n 添加 provider。\n")
-		}
-		for i := start; i < min(len(entries), start+rows); i++ {
-			e := entries[i]
-			line := fmt.Sprintf("  %-8s %s", e.Kind, clean(e.ID))
-			if i == m.cursor {
-				line = accent.Render("›" + line[1:])
-			}
-			b.WriteString(line + "\n")
-		}
-		b.WriteString("\n" + muted.Render("n 新增 provider · m 新增 model · e 编辑 · d 删除\np 预览 · s 保存 · ↑↓ 选择 · q 退出"))
+		b.WriteString(m.browserView())
+		b.WriteString("\n" + muted.Render("↑↓/jk 选择 · Tab 切栏 · →/Enter 进入 · ← 返回 · 空格 折叠\nn 新增提供商 · m 新增模型 · e 编辑 · d 删除 · r 发现模型\np 预览 · s 保存 · q 退出"))
 	}
 	if m.busy {
 		b.WriteString("\n处理中…")
+		if m.cancelDiscovery != nil {
+			b.WriteString(" Esc 取消模型发现")
+		}
 	}
 	if m.status != "" {
 		b.WriteString("\n\n" + clean(m.status))

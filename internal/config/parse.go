@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -37,7 +39,43 @@ func (e Entry) Value(name string) string {
 	return v.text
 }
 
-func (e Entry) Dynamic(name string) bool { return e.options[name].dynamic }
+func (e Entry) Dynamic(name string) bool {
+	if _, changed := e.changes[name]; changed {
+		return false
+	}
+	return e.options[name].dynamic
+}
+
+// RequestValue resolves only a single environment variable reference. Shell
+// evaluation, defaults, concatenation and commands are deliberately unsupported.
+func (e Entry) RequestValue(name string) (string, error) {
+	v := e.Value(name)
+	if !e.Dynamic(name) {
+		if variable, ok := strings.CutPrefix(v, "env:"); ok && name == "api-key" {
+			resolved := os.Getenv(variable)
+			if !envName.MatchString(variable) || resolved == "" {
+				return "", errors.New("API Key 引用的环境变量未设置或为空")
+			}
+			return resolved, nil
+		}
+		return v, nil
+	}
+	if strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
+		v = v[1 : len(v)-1]
+	}
+	variable, ok := strings.CutPrefix(v, "$")
+	if strings.HasPrefix(variable, "{") && strings.HasSuffix(variable, "}") {
+		variable = variable[1 : len(variable)-1]
+	}
+	if !ok || !envName.MatchString(variable) {
+		return "", errors.New("模型发现只支持字面值或单个环境变量引用，不执行动态 Shell 表达式")
+	}
+	resolved := os.Getenv(variable)
+	if resolved == "" {
+		return "", errors.New("模型发现需要的环境变量未设置或为空")
+	}
+	return resolved, nil
+}
 
 func wordValue(w *syntax.Word, src string) value {
 	v := value{raw: src[w.Pos().Offset():w.End().Offset()], start: int(w.Pos().Offset()), end: int(w.End().Offset())}

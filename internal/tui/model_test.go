@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +22,10 @@ func update(t *testing.T, m Model, msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func TestCreatePreviewSaveAndReload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[{"id":"auto-model"}]}`)
+	}))
+	defer server.Close()
 	for _, dry := range []bool{false, true} {
 		t.Run(map[bool]string{false: "save", true: "dry-run"}[dry], func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "crushrc")
@@ -33,15 +40,24 @@ func TestCreatePreviewSaveAndReload(t *testing.T) {
 			}
 			m.inputs[0].SetValue("my-api")
 			m.inputs[1].SetValue("My API")
-			m.inputs[3].SetValue("https://example.com/v1")
+			m.inputs[3].SetValue(server.URL + "/v1")
 			m.inputs[4].SetValue("super-private-key")
 			if strings.Contains(m.View(), "super-private-key") {
 				t.Fatal("secret visible")
 			}
-			m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+			m, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 			if len(d.Entries()) != 1 {
 				t.Fatal("provider not created", m.status)
 			}
+			if cmd == nil || !m.busy {
+				t.Fatal("automatic discovery not started")
+			}
+			m, _ = update(t, m, cmd())
+			if !m.modelPane || len(m.models()) != 1 {
+				t.Fatal("discovered model not shown", m.status)
+			}
+			m, _ = update(t, m, key("d"))
+			m, _ = update(t, m, key("y"))
 			m, _ = update(t, m, key("m"))
 			m.inputs[0].SetValue("my-api/model-v1")
 			m.inputs[1].SetValue("Model V1")
@@ -49,7 +65,7 @@ func TestCreatePreviewSaveAndReload(t *testing.T) {
 			if len(d.Entries()) != 2 {
 				t.Fatal("model not created", m.status)
 			}
-			m, cmd := update(t, m, key("p"))
+			m, cmd = update(t, m, key("p"))
 			if cmd == nil {
 				t.Fatal("preview command missing")
 			}
