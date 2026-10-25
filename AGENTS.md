@@ -13,7 +13,9 @@
 ## 当前状态
 
 - Go module：`coy`；现有 `go.mod` 声明 `go 1.27.1`，不要无故改动版本。
-- 初始化时尚无 Go 源码、测试和 Bubble Tea 依赖；下述目录及验证命令是后续开发约定。
+- 已实现 Go + Bubble Tea v1 TUI；入口 `cmd/coy/`，界面 `internal/tui/`，Bash AST 解析和安全保存位于 `internal/config/`。
+- 项目名 `coy` 是 `crush-on-you` 的缩写；GitHub 仓库为 <https://github.com/jokergaming/coy>。
+- 使用 `make check` 验证，`make build` 生成 `bin/coy`，`make dist VERSION=...` 打包。CI 验证 push/PR，仅 `v*` 标签触发 Release。
 - `.crush/` 是 Crush 的项目级日志和配置目录，与本项目管理目标无关；忽略该目录，不读取、修改或将其作为测试素材。
 
 ## Crush 配置契约
